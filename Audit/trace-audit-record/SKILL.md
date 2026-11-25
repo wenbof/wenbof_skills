@@ -1,6 +1,6 @@
 ---
 name: trace-audit-record
-description: Trace an audit RecordId around an approximate time through a configured ingestion pipeline. Collect precise timestamps, routing evidence, tenant identity, query references, and search-coverage limitations.
+description: Trace an audit RecordId around an approximate time through a configured pipeline. Choose consumer 1 (default, NRTFE plus Audit DR plus Spark), 2 (also Audit CDPDR), or 3 (also NRTDI). Explain missing record events with correlated diagnostics and source clues, distinguishing receipt from forwarding.
 ---
 
 # Trace an audit record
@@ -22,6 +22,7 @@ Required:
 
 Optional:
 
+- Consumer option: `consumer=1|2|3`; defaults to `1`.
 - Expected organization or tenant ID.
 - Environment, region, deployment, or workload.
 - Known request IDs, correlation IDs, batch IDs, or destinations.
@@ -31,26 +32,61 @@ Example:
 > Trace RecordId <record-guid> around 2026-01-15 18:35 UTC using the configured
 > audit pipeline.
 
+Append `consumer=2` or `consumer=3` to select an additional downstream consumer.
+
 Ask for a missing date or ambiguous timezone before searching. Convert times to
 UTC. Do not silently inherit an environment from unrelated conversation history.
 
 An expected tenant ID is not required to start. Discover observed tenant IDs
 from record-bearing evidence, keeping them separate from any supplied value.
 
+## Consumer options
+
+| Parameter | Components to trace |
+| --- | --- |
+| `consumer=1` (default) | NRTFE + Audit DR + Spark |
+| `consumer=2` | NRTFE + Audit DR + Spark + Audit CDPDR |
+| `consumer=3` | NRTFE + Audit DR + Spark + NRTDI |
+
+Resolve the option before discovery or searching. If omitted, use **1 for this
+invocation**; do not inherit an earlier selection. A clearly named path may be
+mapped to its corresponding option. Ask for clarification for values outside
+1-3, multiple selections, or a conflict between a numeric option and named path.
+
+Option 1 stops at Spark. Option 2 adds only Audit CDPDR. Option 3 adds only
+NRTDI. Query only the selected components; other stages are out of scope, not
+missing or failed. Do not query optional branches "just in case" or require
+their configuration for a different option.
+
+Exception: when explaining a missing selected stage, a narrowly scoped diagnostic
+pivot through another branch is allowed if needed to identify the shared
+message. Explain why it is relevant; label it supporting evidence, not an
+additional selected stage or proof of the missing stage's processing.
+
+NRTFE denotes the ingestion frontend, Audit DR the input router, and Spark the
+stream processor. Audit CDPDR and NRTDI are separate downstream consumers.
+Resolve each from approved configuration; similar names are not interchangeable.
+
+For an explicitly requested comparison, reuse common-prefix evidence only for
+the same record, environment, scope, and time window. Report each option's
+selected stages and conclusion separately.
+
 ## Environment configuration
 
 Use an approved local configuration or explicit context to establish the stage
-mapping. A typical pipeline contains:
+mapping for the selected option:
 
 | Logical stage | Required configuration |
 | --- | --- |
-| Ingestion frontend | Endpoint, namespace/table, record event, identity filters |
-| Input router | Endpoint, namespace/table, diagnostic or record event, identity filters |
-| Stream processor | Endpoint, namespace/table, structured record event, identity filters |
-| Output router | Endpoint, namespace/table, record event, identity filters |
+| NRTFE / ingestion frontend | Endpoint, namespace/table, record event, identity filters |
+| Audit DR / input router | Endpoint, namespace/table, diagnostic or record event, identity filters |
+| Spark / stream processor | Endpoint, namespace/table, structured record event, identity filters |
+| Audit CDPDR (option 2 only) | Its own endpoint, namespace/table, record event, identity filters |
+| NRTDI (option 3 only) | Its own endpoint, namespace/table, record event, identity filters |
 
-These are logical roles, not a claim that every pipeline uses four stages or
-processes them in this order. Honor the configured topology, including branches.
+The options select investigation scope, not proof of actual record routing.
+Honor the configured topology and observed branches. Never substitute one
+downstream consumer's mapping or evidence for the other.
 
 For each stage, identify the available fields for:
 
@@ -139,6 +175,8 @@ the requested tenant/RecordId pair.
 
 ### 4. Follow observed routing
 
+Follow only the components selected by the resolved consumer option.
+
 Use each matching row to narrow downstream scope. A record can move to another
 deployment or region. Discover matching downstream identities rather than
 assuming every stage uses the same deployment.
@@ -155,6 +193,13 @@ inferring completion solely from upstream or downstream observations.
 Fetch full text when an inline sample clips the matching identifier or tenant
 association. Preserve only relevant excerpts, not entire unrelated batches.
 
+For option 2, inspect Audit CDPDR's own record and diagnostic events. For option
+3, do the same for NRTDI using its independently configured mapping. Collect the
+selected consumer's record/tenant identity, precise time, processing action,
+destination, and relevant request or correlation identifiers. A match in one
+consumer does not confirm the other. Do not infer either consumer's passage
+solely from Spark completion.
+
 ### 5. Interpret timestamps and success conservatively
 
 Use the field documented as the precise event or processing time. A generic
@@ -168,8 +213,55 @@ To claim send success, obtain an explicit success event or verify that the
 applicable logging call occurs after an awaited send succeeds. Distinguish
 current source behavior from a verified deployed revision.
 
+Check where a processor emits its completion event relative to serialization
+and the output writer. A "Processed" event can precede the actual send.
+Do not treat payload-storage fields, such as inline versus blob location, as
+consumer-routing selectors without explicit source/configuration evidence.
+
 Do not equate an outbound send with downstream durability, indexing, or
 customer searchability without separate evidence.
+
+### 6. Explain missing record events
+
+Before concluding that a selected stage is not confirmed, inspect its
+diagnostic events as well as its record-completeness event. An empty RecordId
+search is an observation to explain, not a cause or proof of non-receipt.
+
+1. Establish whether the stage was expected to receive this record using the
+   observed destination and applicable topology, record type, operation, and
+   routing configuration. Selection of a consumer alone does not establish this.
+2. Pivot from an exact-record match to its local processing correlation, then
+   capture the message ID, payload correlation, tenant, and source position.
+   Search the missing stage for those observed message identifiers. Processing
+   correlation IDs can change between consumers or retries. Partition/sequence/
+   offset tuples are not globally unique; verify the source and message link.
+   Tenant/time proximity alone is not a record-to-message association.
+3. If an initial successful search is empty, expand according to the time-range
+   rules. Downstream receipt may occur outside the initial five-minute block.
+   When a message is found, use its actual time and local correlation to retrieve
+   receive, parse, filter, send, retry, and error diagnostics in a thin slice.
+4. Compare input membership with post-filter and sender counts. A received
+   message with zero records passed to the sender differs from non-receipt or
+   send failure. Aggregate counts alone do not identify which record was removed
+   from a multi-record batch. Zero post-filter counts do not prove a specific
+   policy blocked it. An informational blob/token message is not a failure
+   without a corresponding error.
+5. Where needed, trace the applicable code from consumer initialization through
+   parsing, filters, sender, and record-event emission. Check the correct
+   deployment flavor, allow/block list, feature flags, and logging/sampling
+   behavior. Cite repository, path, line range, and commit. Current configuration
+   or code is a clue, not proof of the deployed version or runtime flag value.
+6. Classify the result as confirmed non-routing, confirmed filtering,
+   processing/send failure, received but forwarding unconfirmed, coverage/
+   logging limitation, or unresolved. Call a cause confirmed only when correlated
+   runtime evidence establishes it. Otherwise separate the observed outcome
+   from the code-backed hypothesis and name the missing verification.
+
+For each missing or partially confirmed stage, report the exact diagnostic
+excerpt and UTC time, correlation chain, searched scope/window and query
+coverage, classification, source clues, and remaining uncertainty. Preserve
+unsuccessful checks too. If no reason can be established, say so explicitly.
+Do not invent a filtering, routing, or loss explanation to fill the gap.
 
 ## Query lifecycle and coverage
 
@@ -194,16 +286,24 @@ customer searchability without separate evidence.
 
 Lead with the conclusion: which stages are confirmed and whether the observed
 tenant matches any expected tenant. State the environment, RecordId, and
-searched UTC time range.
+selected consumer (including whether it defaulted to 1), and searched UTC time
+range. Limit a full-path conclusion to the selected components.
 
-Use a compact evidence table adapted to the configured stages:
+Use a compact evidence table for the three common stages:
 
 | Stage | Status | Precise UTC timestamp | Observed action and evidence |
 | --- | --- | --- | --- |
-| Ingestion frontend | Confirmed / not confirmed / blocked | Time or unavailable | Event, matched identifiers, routing |
-| Input router | Confirmed / not confirmed / blocked | Parse/send times | Record membership and send result |
-| Stream processor | Confirmed / not confirmed / blocked | Processing time | Processing state, application, stage |
-| Output router | Confirmed / not confirmed / blocked | Event time | Destination and send evidence |
+| NRTFE | Confirmed / not confirmed / blocked | Time or unavailable | Event, matched identifiers, routing |
+| Audit DR | Confirmed / not confirmed / blocked | Parse/send times | Record membership and send result |
+| Spark | Confirmed / not confirmed / blocked | Processing time | Processing state, application, stage |
+
+Append an Audit CDPDR row only for option 2, or an NRTDI row only for option 3.
+Option 1 has three rows; options 2 and 3 each have four. Never count unselected
+components as missing or failed.
+
+Use a more precise status where supported, such as "received; forwarding not
+confirmed" or "filtered (confirmed)"; do not reduce these to a binary result.
+Put any alternate-branch diagnostic pivot below the selected-stage table.
 
 Explicitly label tenant mismatches. Explain significant timestamp differences
 and distinguish directly observed actions from inferred relationships.
@@ -213,10 +313,14 @@ success.
 When supported, preserve a JSON artifact in approved session storage containing:
 
 - Requested inputs and observed tenant identity.
+- Resolved `consumer`, `consumerDefaulted`, and selected components.
 - Per-stage timestamps with their source field names.
 - Minimal relevant evidence excerpts.
 - Query IDs, endpoints, predicates, scope, and time bounds.
 - Completion state, coverage limitations, and unresolved blockers.
+- For a missing record event: diagnostic evidence and correlation chain,
+  observed outcome, classification, confirmed versus hypothesized cause,
+  source references/revision, and unverified deployment or runtime settings.
 
 Attach or link the artifact through supported session tools. Keep credentials,
 unrelated customer data, and private configuration out of public repositories.
